@@ -36,6 +36,71 @@ import {
   filterIntrospectionRows,
   type FilterableIntrospectionKind,
 } from "./../security/redact.js";
+import { resolveEnvironment } from "./../config/environments.js";
+
+// Sentinel pool key for legacy single-environment mode (no MYSQL_ENVIRONMENTS).
+const DEFAULT_POOL_KEY = "__default__";
+
+/**
+ * A resolved execution target: which pool to use and which write-permission
+ * checks apply. In legacy mode the checks are the schema-aware global helpers;
+ * in multi-env mode they are the environment's boolean flags.
+ */
+interface ExecutionTarget {
+  poolKey: string;
+  poolConfig: mysql2.PoolOptions;
+  isInsertAllowed: (schema: string | null) => boolean;
+  isUpdateAllowed: (schema: string | null) => boolean;
+  isDeleteAllowed: (schema: string | null) => boolean;
+  isDdlAllowed: (schema: string | null) => boolean;
+}
+
+/**
+ * Resolve the execution target for a tool call. Returns `{ error }` (fail-closed)
+ * when a multi-env name is missing/unknown. In legacy mode `envName` is ignored
+ * and the flat-env defaults are used.
+ */
+function resolveTarget(envName?: string): {
+  target?: ExecutionTarget;
+  error?: string;
+} {
+  const { env, error } = resolveEnvironment(envName);
+  if (error) return { error };
+
+  if (!env) {
+    // Legacy single-environment mode: schema-aware global permission helpers.
+    return {
+      target: {
+        poolKey: DEFAULT_POOL_KEY,
+        poolConfig: config.mysql,
+        isInsertAllowed: isInsertAllowedForSchema,
+        isUpdateAllowed: isUpdateAllowedForSchema,
+        isDeleteAllowed: isDeleteAllowedForSchema,
+        isDdlAllowed: isDDLAllowedForSchema,
+      },
+    };
+  }
+
+  const p = env.permissions;
+  return {
+    target: {
+      poolKey: env.name,
+      poolConfig: env.poolConfig,
+      isInsertAllowed: () => p.insert,
+      isUpdateAllowed: () => p.update,
+      isDeleteAllowed: () => p.delete,
+      isDdlAllowed: () => p.ddl,
+    },
+  };
+}
+
+/** Build the standard error tool-response shape. */
+function errorResult<T>(text: string): T {
+  return {
+    content: [{ type: "text", text }],
+    isError: true,
+  } as T;
+}
 
 // Force read-only mode in multi-DB mode unless explicitly configured otherwise
 if (isMultiDbMode && process.env.MULTI_DB_WRITE_MODE !== "true") {
@@ -54,29 +119,69 @@ function safeExit(code: number): void {
   }
 }
 
-// @INFO: Lazy load MySQL pool
-let poolPromise: Promise<mysql2.Pool>;
+// @INFO: Lazy-loaded MySQL pools, keyed by environment name (or the legacy
+// DEFAULT_POOL_KEY). One pool per configured target, created on first use.
+const pools = new Map<string, Promise<mysql2.Pool>>();
 
-const getPool = (): Promise<mysql2.Pool> => {
-  if (!poolPromise) {
-    poolPromise = new Promise<mysql2.Pool>((resolve, reject) => {
+/** Get (or lazily create) the pool for a given key + config. */
+const getPoolFor = (
+  key: string,
+  poolConfig: mysql2.PoolOptions,
+): Promise<mysql2.Pool> => {
+  let existing = pools.get(key);
+  if (!existing) {
+    existing = new Promise<mysql2.Pool>((resolve, reject) => {
       try {
-        const pool = mysql2.createPool(config.mysql);
-        log("info", "MySQL pool created successfully");
+        const pool = mysql2.createPool(poolConfig);
+        log("info", `MySQL pool created successfully for '${key}'`);
         resolve(pool);
       } catch (error) {
-        log("error", "Error creating MySQL pool:", error);
+        log("error", `Error creating MySQL pool for '${key}':`, error);
         reject(error);
       }
     });
+    pools.set(key, existing);
   }
-  return poolPromise;
+  return existing;
 };
 
-async function executeQuery<T>(sql: string, params: string[] = []): Promise<T> {
+/**
+ * Get the pool for a resolved target (default environment when `envName` is
+ * omitted). Kept for callers that only need a connection (resources, startup
+ * probe). Throws if a multi-env name is invalid.
+ */
+const getPool = (envName?: string): Promise<mysql2.Pool> => {
+  const { target, error } = resolveTarget(envName);
+  if (error || !target) {
+    throw new Error(error ?? "Could not resolve MySQL environment");
+  }
+  return getPoolFor(target.poolKey, target.poolConfig);
+};
+
+/** Close every open pool. Used by the shutdown handler. */
+async function closeAllPools(): Promise<void> {
+  const open = [...pools.values()];
+  pools.clear();
+  await Promise.all(
+    open.map(async (p) => {
+      try {
+        const pool = await p;
+        await pool.end();
+      } catch (err) {
+        log("error", "Error closing pool:", err);
+      }
+    }),
+  );
+}
+
+async function executeQuery<T>(
+  sql: string,
+  params: string[] = [],
+  envName?: string,
+): Promise<T> {
   let connection;
   try {
-    const pool = await getPool();
+    const pool = await getPool(envName);
     connection = await pool.getConnection();
     const result = await connection.query(sql, params);
     return (Array.isArray(result) ? result[0] : result) as T;
@@ -92,10 +197,14 @@ async function executeQuery<T>(sql: string, params: string[] = []): Promise<T> {
 }
 
 // @INFO: New function to handle write operations
-async function executeWriteQuery<T>(sql: string): Promise<T> {
+async function executeWriteQuery<T>(sql: string, envName?: string): Promise<T> {
   let connection;
   try {
-    const pool = await getPool();
+    const { target, error } = resolveTarget(envName);
+    if (error || !target) {
+      return errorResult<T>(`Error: ${error ?? "Could not resolve MySQL environment"}`);
+    }
+    const pool = await getPoolFor(target.poolKey, target.poolConfig);
     connection = await pool.getConnection();
     log("error", "Write connection acquired");
 
@@ -197,9 +306,21 @@ async function executeWriteQuery<T>(sql: string): Promise<T> {
   }
 }
 
-async function executeReadOnlyQuery<T>(sql: string): Promise<T> {
+async function executeReadOnlyQuery<T>(
+  sql: string,
+  envName?: string,
+): Promise<T> {
   let connection;
   try {
+    // Resolve which environment (pool + write permissions) this call targets.
+    // Fail-closed on an unknown/missing multi-env name.
+    const { target, error: targetError } = resolveTarget(envName);
+    if (targetError || !target) {
+      return errorResult<T>(
+        `Error: ${targetError ?? "Could not resolve MySQL environment"}`,
+      );
+    }
+
     // PII redaction works hand-in-hand with explicit column projection: the
     // schema endpoint hides redacted columns, so the LLM should never need
     // SELECT *. Refusing wildcard projections here prevents the LLM from
@@ -342,7 +463,7 @@ async function executeReadOnlyQuery<T>(sql: string): Promise<T> {
     }
 
     // Check schema-specific permissions
-    if (isInsertOperation && !isInsertAllowedForSchema(schema)) {
+    if (isInsertOperation && !target.isInsertAllowed(schema)) {
       log(
         "error",
         `INSERT operations are not allowed for schema '${schema || "default"}'. Configure SCHEMA_INSERT_PERMISSIONS.`,
@@ -358,7 +479,7 @@ async function executeReadOnlyQuery<T>(sql: string): Promise<T> {
       } as T;
     }
 
-    if (isUpdateOperation && !isUpdateAllowedForSchema(schema)) {
+    if (isUpdateOperation && !target.isUpdateAllowed(schema)) {
       log(
         "error",
         `UPDATE operations are not allowed for schema '${schema || "default"}'. Configure SCHEMA_UPDATE_PERMISSIONS.`,
@@ -374,7 +495,7 @@ async function executeReadOnlyQuery<T>(sql: string): Promise<T> {
       } as T;
     }
 
-    if (isDeleteOperation && !isDeleteAllowedForSchema(schema)) {
+    if (isDeleteOperation && !target.isDeleteAllowed(schema)) {
       log(
         "error",
         `DELETE operations are not allowed for schema '${schema || "default"}'. Configure SCHEMA_DELETE_PERMISSIONS.`,
@@ -390,7 +511,7 @@ async function executeReadOnlyQuery<T>(sql: string): Promise<T> {
       } as T;
     }
 
-    if (isDDLOperation && !isDDLAllowedForSchema(schema)) {
+    if (isDDLOperation && !target.isDdlAllowed(schema)) {
       log(
         "error",
         `DDL operations are not allowed for schema '${schema || "default"}'. Configure SCHEMA_DDL_PERMISSIONS.`,
@@ -408,16 +529,16 @@ async function executeReadOnlyQuery<T>(sql: string): Promise<T> {
 
     // For write operations that are allowed, use executeWriteQuery
     if (
-      (isInsertOperation && isInsertAllowedForSchema(schema)) ||
-      (isUpdateOperation && isUpdateAllowedForSchema(schema)) ||
-      (isDeleteOperation && isDeleteAllowedForSchema(schema)) ||
-      (isDDLOperation && isDDLAllowedForSchema(schema))
+      (isInsertOperation && target.isInsertAllowed(schema)) ||
+      (isUpdateOperation && target.isUpdateAllowed(schema)) ||
+      (isDeleteOperation && target.isDeleteAllowed(schema)) ||
+      (isDDLOperation && target.isDdlAllowed(schema))
     ) {
-      return executeWriteQuery(sql);
+      return executeWriteQuery(sql, envName);
     }
 
     // For read-only operations, continue with the original logic
-    const pool = await getPool();
+    const pool = await getPoolFor(target.poolKey, target.poolConfig);
     connection = await pool.getConnection();
     log("error", "Read-only connection acquired");
 
@@ -542,5 +663,5 @@ export {
   getPool,
   executeWriteQuery,
   executeReadOnlyQuery,
-  poolPromise,
+  closeAllPools,
 };

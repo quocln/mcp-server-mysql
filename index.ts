@@ -37,8 +37,14 @@ import {
   getPool,
   executeQuery,
   executeReadOnlyQuery,
-  poolPromise,
+  closeAllPools,
 } from "./src/db/index.js";
+import {
+  isMultiEnvMode,
+  environmentNames,
+  DEFAULT_ENV_NAME,
+  MYSQL_ENVIRONMENTS,
+} from "./src/config/environments.js";
 
 import express, { Request, Response } from "express";
 import { fileURLToPath } from 'url';
@@ -97,12 +103,40 @@ if (
 }
 
 // Determine if we're in read-only mode (no write operations enabled)
-const isReadOnly = !(
+let isReadOnly = !(
   ALLOW_INSERT_OPERATION ||
   ALLOW_UPDATE_OPERATION ||
   ALLOW_DELETE_OPERATION ||
   ALLOW_DDL_OPERATION
 );
+
+// Multi-environment mode: the per-call `env` argument selects the target, so the
+// global ALLOW_* flags above don't apply. Rebuild the description from the
+// configured environments and treat the tool as read-only only when EVERY
+// environment is read-only.
+if (isMultiEnvMode) {
+  const names = environmentNames();
+  const parts = names.map((name) => {
+    const perms = MYSQL_ENVIRONMENTS.get(name)!.permissions;
+    const writes = [
+      perms.insert && "INSERT",
+      perms.update && "UPDATE",
+      perms.delete && "DELETE",
+      perms.ddl && "DDL",
+    ].filter(Boolean);
+    const caps = writes.length ? writes.join("/") : "READ-ONLY";
+    return `${name}${name === DEFAULT_ENV_NAME ? " (default)" : ""}: ${caps}`;
+  });
+  toolDescription =
+    `[${toolVersion}] Run SQL queries against MySQL. ` +
+    `Pass the "env" argument to pick a target environment [${parts.join("; ")}]. ` +
+    `Omit "env" to use the default (${DEFAULT_ENV_NAME}).`;
+
+  isReadOnly = names.every((name) => {
+    const p = MYSQL_ENVIRONMENTS.get(name)!.permissions;
+    return !(p.insert || p.update || p.delete || p.ddl);
+  });
+}
 
 // @INFO: Add debug logging for configuration
 log(
@@ -134,6 +168,31 @@ log(
   ),
 );
 
+// Shared input schema for the mysql_query tool. In multi-environment mode an
+// optional `env` argument (constrained to the configured names) lets the caller
+// pick a target per query.
+const mysqlQueryInputSchema = {
+  type: "object" as const,
+  properties: {
+    sql: {
+      type: "string",
+      description: "The SQL query to execute",
+    },
+    ...(isMultiEnvMode
+      ? {
+          env: {
+            type: "string",
+            enum: environmentNames(),
+            description: `Target environment. One of: ${environmentNames().join(
+              ", ",
+            )}. Omit to use the default (${DEFAULT_ENV_NAME}).`,
+          },
+        }
+      : {}),
+  },
+  required: ["sql"],
+};
+
 // Define configuration schema
 export const configSchema = z.object({
   debug: z.boolean().default(false).describe("Enable debug logging"),
@@ -159,16 +218,7 @@ export default function createMcpServer({
         tools: {
           mysql_query: {
             description: toolDescription,
-            inputSchema: {
-              type: "object",
-              properties: {
-                sql: {
-                  type: "string",
-                  description: "The SQL query to execute",
-                },
-              },
-              required: ["sql"],
-            },
+            inputSchema: mysqlQueryInputSchema,
             annotations: {
               readOnlyHint: isReadOnly,
               idempotentHint: isReadOnly,
@@ -316,7 +366,8 @@ export default function createMcpServer({
       }
 
       const sql = request.params.arguments?.sql as string;
-      return await executeReadOnlyQuery(sql);
+      const env = request.params.arguments?.env as string | undefined;
+      return await executeReadOnlyQuery(sql, env);
     } catch (err) {
       const error = err as Error;
       log("error", "Error in CallToolRequest handler:", error);
@@ -339,16 +390,7 @@ export default function createMcpServer({
         {
           name: "mysql_query",
           description: toolDescription,
-          inputSchema: {
-            type: "object",
-            properties: {
-              sql: {
-                type: "string",
-                description: "The SQL query to execute",
-              },
-            },
-            required: ["sql"],
-          },
+          inputSchema: mysqlQueryInputSchema,
           annotations: {
             readOnlyHint: isReadOnly,
             idempotentHint: isReadOnly,
@@ -387,11 +429,8 @@ export default function createMcpServer({
   const shutdown = async (signal: string): Promise<void> => {
     log("error", `Received ${signal}. Shutting down...`);
     try {
-      // Only attempt to close the pool if it was created
-      if (poolPromise) {
-        const pool = await poolPromise;
-        await pool.end();
-      }
+      // Close every open pool (one per configured environment).
+      await closeAllPools();
     } catch (err) {
       log("error", "Error closing pool:", err);
       throw err;
