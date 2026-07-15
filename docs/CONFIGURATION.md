@@ -61,6 +61,89 @@ Multi-DB mode: `MULTI_DB_WRITE_MODE=false` (default — write disabled across al
 
 See [README-MULTI-DB.md](../README-MULTI-DB.md) for full details.
 
+## Multiple Environments
+
+Expose several named MySQL targets (e.g. `local`, `qa1`, `qa2`) from a single
+server. The LLM picks one **per query** via the tool's `env` argument. Each
+environment has its own connection **and** its own write-permission flags.
+
+| Variable | Default | Description |
+|---|---|---|
+| `MYSQL_ENVIRONMENTS_FILE` | — | Path to a JSON file defining the environments (preferred) |
+| `MYSQL_ENVIRONMENTS` | — | Same JSON inline as a single string (used only if the file var is unset/unreadable) |
+| `MYSQL_DEFAULT_ENV` | first entry | Environment used when a query omits `env` |
+
+> The MCP client passes only flat **string** env vars, so a nested object placed
+> directly under `env` is **not** supported — use `MYSQL_ENVIRONMENTS_FILE`.
+
+**MCP client config** stays clean — just point at the file:
+
+```json
+{
+  "mcpServers": {
+    "dm-mysql": {
+      "command": "/path/to/node",
+      "args": ["/path/to/mcp-server-mysql/dist/index.js"],
+      "env": {
+        "MYSQL_DEFAULT_ENV": "local",
+        "MYSQL_ENVIRONMENTS_FILE": "/path/to/mcp-envs.json"
+      }
+    }
+  }
+}
+```
+
+**`mcp-envs.json`** — each entry accepts the familiar `MYSQL_*` / `ALLOW_*`
+names (shown) or short keys (`host`, `port`, `user`, `password`, `database`,
+`socketPath`, `allowInsert`, `allowUpdate`, `allowDelete`, `allowDdl`):
+
+```json
+{
+  "local": {
+    "MYSQL_HOST": "127.0.0.1",
+    "MYSQL_PORT": "3306",
+    "MYSQL_USER": "root",
+    "MYSQL_PASS": "",
+    "MYSQL_DB": "app_development",
+    "ALLOW_INSERT_OPERATION": "false",
+    "ALLOW_UPDATE_OPERATION": "false",
+    "ALLOW_DELETE_OPERATION": "false"
+  },
+  "qa1": {
+    "MYSQL_HOST": "127.0.0.1",
+    "MYSQL_PORT": "3306",
+    "MYSQL_USER": "qa_user",
+    "MYSQL_PASS": "qa_password",
+    "MYSQL_DB": "app_qa1",
+    "ALLOW_INSERT_OPERATION": "false",
+    "ALLOW_UPDATE_OPERATION": "false",
+    "ALLOW_DELETE_OPERATION": "false"
+  }
+}
+```
+
+**Usage**
+
+- Call `mysql_query` with `{ "sql": "SELECT ...", "env": "qa1" }` to target `qa1`.
+- Omit `env` → the `MYSQL_DEFAULT_ENV` environment is used.
+- An unknown/missing `env` returns an error listing the valid names (fail-closed);
+  no query runs.
+
+**Notes**
+
+- Write permissions are **per environment** (the four `ALLOW_*` flags default to
+  `false`). PII redaction and `MYSQL_DISABLE_READ_ONLY_TRANSACTIONS` remain
+  **global**, shared by every environment.
+- On startup the server tests a connection to the **default** environment only.
+  Keep `MYSQL_DEFAULT_ENV` pointing at a reachable database — if it is
+  unreachable the server exits and the MCP client shows it as failed. Other
+  environments connect lazily on first use.
+- When neither `MYSQL_ENVIRONMENTS_FILE` nor `MYSQL_ENVIRONMENTS` is set, the
+  server runs in legacy single-environment mode using the flat `MYSQL_*` /
+  `ALLOW_*` vars above (unchanged), and the `env` argument is ignored.
+- ⚠️ A `mcp-envs.json` holding real credentials must not be committed — add it to
+  `.gitignore`.
+
 ## PII Redaction
 
 See [PII-REDACTION.md](./PII-REDACTION.md) for full documentation.

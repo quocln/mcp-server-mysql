@@ -18,6 +18,7 @@ MCP server that gives Claude and other LLMs access to MySQL — inspect schemas,
 - **Claude Code integration** — optimized for Anthropic's Claude Code CLI
 - **SSH tunnel support** — built-in support for remote databases
 - **Multi-DB mode** — query across multiple databases without reconnecting
+- **Multiple environments** — expose several named targets (e.g. `local`, `qa`); the LLM picks one per query via an `env` argument
 - **Schema-specific permissions** — per-database read/write control
 - **PII redaction** — automatic masking of sensitive data in results
 - **Remote mode** — HTTP transport with bearer token auth
@@ -68,7 +69,7 @@ All write operations are disabled by default. Enable with `ALLOW_INSERT_OPERATIO
 ## Documentation
 
 - [Installation Guide](docs/INSTALLATION.md) — Smithery, Cursor, Codex, Claude Code, local repo, remote mode
-- [Configuration & Environment Variables](docs/CONFIGURATION.md) — all env vars, advanced config
+- [Configuration & Environment Variables](docs/CONFIGURATION.md) — all env vars, advanced config, multiple environments
 - [Multi-DB Mode](README-MULTI-DB.md) — querying multiple databases
 - [PII Redaction](docs/PII-REDACTION.md) — automatic data masking
 - [Testing](docs/TESTING.md) — test setup and running
